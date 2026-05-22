@@ -151,6 +151,52 @@ namespace UCanvas
     }
 }
 
+// Light effect fixes
+namespace FDynamicLight
+{
+    constexpr uintptr_t kActorLevelOff = 0x6C;  // AActor::Level
+    constexpr uintptr_t kLevelTimeOff  = 0x3C4; // ULevel::TimeSeconds
+
+    constexpr float kFlickerHz = 30.0f;
+
+    // LT_Flicker
+    static float __cdecl ComputeFlicker(void* actor)
+    {
+        if (!actor)
+            return 1.0f;
+
+        void* level = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(actor) + kActorLevelOff);
+        if (!level)
+            return 1.0f;
+
+        const float timeSeconds = *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(level) + kLevelTimeOff);
+        const uint32_t window = static_cast<uint32_t>(static_cast<int32_t>(timeSeconds * kFlickerHz));
+        const uint32_t seed = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(actor));
+
+        uint32_t h = window * 0x9E3779B1u ^ (seed + 0x9E3779B9u) * 0x85EBCA77u;
+        h ^= h >> 16; h *= 0x7FEB352Du;
+        h ^= h >> 15; h *= 0x846CA68Bu;
+        h ^= h >> 16;
+        return static_cast<float>(h >> 8) * (1.0f / 16777216.0f);
+    }
+
+    __declspec(naked) void FlickerRand()
+    {
+        __asm
+        {
+            push eax
+            call ComputeFlicker
+            add  esp, 4
+            ret
+        }
+    }
+
+    // LT_Strobe
+    constexpr float kStrobeHz = 30.0f;
+    uintptr_t pStrobeToggle     = 0;
+    uintptr_t pStrobeLastUpdate = 0;
+}
+
 #if _DEBUG
 SafetyHookInline shFindAxisName = {};
 float* __fastcall FindAxisName(void* UInput, void* edx, void* AActor, const wchar_t* a3)
@@ -309,6 +355,30 @@ export void InitEngine()
     UGameEngine::shTick = safetyhook::create_inline(GetProcAddress(GetModuleHandle(L"Engine"), "?Tick@UGameEngine@@UAEXM@Z"), UGameEngine::Tick);
 
     UCanvas::shSetClip = safetyhook::create_inline(GetProcAddress(GetModuleHandle(L"Engine"), "?SetClip@UCanvas@@UAEXMM@Z"), UCanvas::SetClip);
+
+    // Light effect fixes
+    pattern = find_module_pattern(GetModuleHandle(L"Engine"), "80 F9 04 75 ? DD D8 FF 15 ? ? ? ? D8 15 ? ? ? ? DF E0 F6 C4 05");
+    injector::MakeCALL(pattern.get_first(7), FDynamicLight::FlickerRand, true);
+    injector::WriteMemory<uint8_t>(pattern.get_first(12), 0x90, true);
+
+    pattern = find_module_pattern(GetModuleHandle(L"Engine"), "80 F9 05 75 ? 8B 48 6C DD D8 D9 05 ? ? ? ? D8 99 C4 03 00 00 DF E0 F6 C4 44 7B ? 8B 81 C4 03 00 00 A3 ? ? ? ? A1 ? ? ? ?");
+    FDynamicLight::pStrobeLastUpdate = *pattern.get_first<uintptr_t>(12);
+    FDynamicLight::pStrobeToggle     = *pattern.get_first<uintptr_t>(41);
+    static auto LightStrobeHook = safetyhook::create_mid(pattern.get_first(5), [](SafetyHookContext& regs)
+    {
+        void* actor = reinterpret_cast<void*>(regs.eax);
+        if (!actor)
+            return;
+        void* level = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(actor) + FDynamicLight::kActorLevelOff);
+        if (!level)
+            return;
+
+        const float timeSeconds = *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(level) + FDynamicLight::kLevelTimeOff);
+
+        *reinterpret_cast<uint32_t*>(FDynamicLight::pStrobeToggle) = static_cast<uint32_t>(static_cast<int32_t>(timeSeconds * FDynamicLight::kStrobeHz)) & 1u;
+
+        *reinterpret_cast<float*>(FDynamicLight::pStrobeLastUpdate) = timeSeconds;
+    });
 
     pattern = find_module_pattern(GetModuleHandle(L"Engine"), "8B 85 40 01 00 00 6A 00 8B 48 18");
     static auto UGameEngineLoadGameHook = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
